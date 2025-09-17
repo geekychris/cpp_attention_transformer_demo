@@ -29,12 +29,17 @@ class SGDOptimizer {
 private:
     float learning_rate;
     float weight_decay;
+    float max_grad_norm;
     
 public:
-    SGDOptimizer(float lr = 0.001f, float decay = 0.0f);
+    SGDOptimizer(float lr = 0.001f, float decay = 0.0f, float max_norm = 1.0f);
     void update(Matrix& weights, const Matrix& gradients);
     void set_learning_rate(float lr) { learning_rate = lr; }
     float get_learning_rate() const { return learning_rate; }
+    void set_max_grad_norm(float max_norm) { max_grad_norm = max_norm; }
+    
+private:
+    void clip_gradients(Matrix& gradients) const;
 };
 
 // Data loading utilities
@@ -59,6 +64,7 @@ public:
     Batch next_batch();
     void reset();
     size_t size() const { return data.size(); }
+    size_t get_total_batches() const { return (data.size() + batch_size - 1) / batch_size; }
 };
 
 // Training utilities
@@ -67,8 +73,15 @@ private:
     std::unique_ptr<SGDOptimizer> optimizer;
     Gradients gradients;
     
+    // Cache activations during forward pass for backprop
+    mutable Matrix cached_transformer_output;  // Output of last transformer layer
+    mutable std::vector<int> cached_input_tokens;  // Last input tokens
+    
 public:
     TrainingTransformer(size_t vocab_sz, size_t model_dim, size_t heads, size_t layers, size_t ff_dim, size_t max_len);
+    
+    // Override forward to cache activations
+    Matrix forward(const std::vector<int>& tokens) const override;
     
     // Training methods
     float train_step(const DataLoader::Batch& batch);
@@ -81,6 +94,8 @@ public:
     // Model serialization
     void save_model(const std::string& filename) const;
     void load_model(const std::string& filename);
+    void save_model_with_tokenizer(const std::string& filename, const SimpleTokenizer& tokenizer) const;
+    void load_model_with_tokenizer(const std::string& filename, SimpleTokenizer& tokenizer);
     
     // Setters
     void set_learning_rate(float lr);

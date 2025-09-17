@@ -3,7 +3,10 @@
 // Multi-head attention implementation
 MultiHeadAttention::MultiHeadAttention(size_t model_dim, size_t heads) 
     : d_model(model_dim), num_heads(heads), W_q(model_dim, model_dim), 
-      W_k(model_dim, model_dim), W_v(model_dim, model_dim), W_o(model_dim, model_dim) {
+      W_k(model_dim, model_dim), W_v(model_dim, model_dim), W_o(model_dim, model_dim),
+      W_q_grad(model_dim, model_dim), W_k_grad(model_dim, model_dim), 
+      W_v_grad(model_dim, model_dim), W_o_grad(model_dim, model_dim),
+      cached_input(1, 1), cached_Q(1, 1), cached_K(1, 1), cached_V(1, 1), cached_attn_weights(1, 1) {
     
     if (model_dim % heads != 0) {
         throw std::invalid_argument("Model dimension must be divisible by number of heads");

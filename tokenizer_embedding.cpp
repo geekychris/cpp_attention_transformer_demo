@@ -1,6 +1,7 @@
 #include "transformer.h"
 #include <sstream>
 #include <algorithm>
+#include <fstream>
 
 // Define static const members
 const int SimpleTokenizer::PAD_TOKEN;
@@ -79,6 +80,49 @@ std::string SimpleTokenizer::decode(const std::vector<int>& tokens) {
     }
     
     return oss.str();
+}
+
+void SimpleTokenizer::save_vocab(const std::string& filename) const {
+    std::ofstream file(filename);
+    if (!file.is_open()) {
+        std::cerr << "Failed to open vocab file for saving: " << filename << std::endl;
+        return;
+    }
+    
+    // Save next_id first
+    file << next_id << std::endl;
+    
+    // Save all word->id mappings
+    for (const auto& pair : word_to_id) {
+        file << pair.first << " " << pair.second << std::endl;
+    }
+    
+    file.close();
+}
+
+void SimpleTokenizer::load_vocab(const std::string& filename) {
+    std::ifstream file(filename);
+    if (!file.is_open()) {
+        std::cerr << "Failed to open vocab file for loading: " << filename << std::endl;
+        return;
+    }
+    
+    // Clear existing vocabulary
+    word_to_id.clear();
+    id_to_word.clear();
+    
+    // Load next_id
+    file >> next_id;
+    
+    // Load all word->id mappings
+    std::string word;
+    int id;
+    while (file >> word >> id) {
+        word_to_id[word] = id;
+        id_to_word[id] = word;
+    }
+    
+    file.close();
 }
 
 // Embedding layer implementation

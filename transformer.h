@@ -80,9 +80,23 @@ private:
 namespace Activations {
     float relu(float x);
     float gelu(float x);
+    float gelu_derivative(float x);  // GELU derivative for backprop
     Matrix gelu_matrix(const Matrix& x);  // GPU-accelerated GELU for matrices
+    Matrix gelu_derivative_matrix(const Matrix& x);  // GELU derivative for matrices
     Matrix softmax(const Matrix& x);
     Matrix layer_norm(const Matrix& x, const Matrix& gamma, const Matrix& beta, float eps = 1e-5f);
+    
+    // Layer norm backpropagation
+    struct LayerNormGradients {
+        Matrix grad_input;
+        Matrix grad_gamma;
+        Matrix grad_beta;
+        
+        LayerNormGradients(size_t input_rows, size_t input_cols, size_t param_size) 
+            : grad_input(input_rows, input_cols), grad_gamma(param_size, 1), grad_beta(param_size, 1) {}
+    };
+    LayerNormGradients layer_norm_backward(const Matrix& grad_output, const Matrix& input, 
+                                          const Matrix& gamma, const Matrix& beta, float eps = 1e-5f);
 }
 
 // Positional encoding for sequence position information
@@ -102,12 +116,21 @@ private:
     size_t d_model, num_heads, d_k;
     Matrix W_q, W_k, W_v, W_o;  // Weight matrices for Q, K, V and output
     
+    // Gradient storage
+    mutable Matrix W_q_grad, W_k_grad, W_v_grad, W_o_grad;
+    mutable Matrix cached_input, cached_Q, cached_K, cached_V, cached_attn_weights;
+    
     Matrix scaled_dot_product_attention(const Matrix& Q, const Matrix& K, const Matrix& V, bool mask = false) const;
     
 public:
     MultiHeadAttention(size_t model_dim, size_t heads);
     Matrix forward(const Matrix& query, const Matrix& key, const Matrix& value, bool mask = false) const;
     void initialize_weights();
+    
+    // Backpropagation methods
+    Matrix backward(const Matrix& grad_output, bool mask = false) const;
+    void apply_gradients(float learning_rate);
+    void zero_gradients();
 };
 
 // Feed-forward network
@@ -116,10 +139,19 @@ private:
     Matrix W1, b1, W2, b2;
     size_t d_model, d_ff;
     
+    // Gradient storage
+    mutable Matrix W1_grad, b1_grad, W2_grad, b2_grad;
+    mutable Matrix cached_input, cached_h1_pre_gelu, cached_h1_post_gelu;
+    
 public:
     FeedForward(size_t model_dim, size_t ff_dim);
     Matrix forward(const Matrix& x) const;
     void initialize_weights();
+    
+    // Backpropagation methods
+    Matrix backward(const Matrix& grad_output) const;
+    void apply_gradients(float learning_rate);
+    void zero_gradients();
 };
 
 // Transformer encoder layer
@@ -145,10 +177,18 @@ private:
     Matrix gamma1, beta1, gamma2, beta2, gamma3, beta3;  // Layer norm parameters
     size_t d_model;
     
+    // Gradient storage for layer norm parameters
+    mutable Matrix gamma1_grad, beta1_grad, gamma2_grad, beta2_grad, gamma3_grad, beta3_grad;
+    
 public:
     TransformerDecoderLayer(size_t model_dim, size_t num_heads, size_t ff_dim);
     Matrix forward(const Matrix& x, const Matrix& encoder_output) const;
     void initialize_weights();
+    
+    // Backpropagation methods
+    Matrix backward(const Matrix& grad_output, const Matrix& encoder_output) const;
+    void apply_gradients(float learning_rate);
+    void zero_gradients();
 };
 
 // Simple tokenizer
@@ -169,6 +209,8 @@ public:
     std::string decode(const std::vector<int>& tokens);
     int vocab_size() const { return next_id; }
     void add_word(const std::string& word);
+    void save_vocab(const std::string& filename) const;
+    void load_vocab(const std::string& filename);
 };
 
 // Embedding layer
@@ -181,6 +223,9 @@ public:
     Embedding(size_t vocab_sz, size_t model_dim);
     Matrix forward(const std::vector<int>& tokens) const;
     void initialize_weights();
+    
+    // Public accessor for embeddings (for training)
+    Matrix& get_embeddings() { return embeddings; }
 };
 
 // Main Transformer model
@@ -198,7 +243,7 @@ public:
     Transformer(size_t vocab_sz, size_t model_dim, size_t heads, size_t layers, size_t ff_dim, size_t max_len);
     
     // Forward pass for language modeling (decoder-only)
-    Matrix forward(const std::vector<int>& tokens) const;
+    virtual Matrix forward(const std::vector<int>& tokens) const;
     
     // Generate text (simple greedy decoding)
     std::string generate(const std::string& prompt, SimpleTokenizer& tokenizer, size_t max_tokens = 50) const;

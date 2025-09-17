@@ -1,4 +1,6 @@
 #include "transformer.h"
+#include <algorithm>
+#include <random>
 
 // Main Transformer implementation
 Transformer::Transformer(size_t vocab_sz, size_t model_dim, size_t heads, size_t layers, size_t ff_dim, size_t max_len)
@@ -18,8 +20,9 @@ Transformer::Transformer(size_t vocab_sz, size_t model_dim, size_t heads, size_t
 }
 
 void Transformer::initialize_weights() {
-    // Initialize output projection layer
-    float std = std::sqrt(1.0f / d_model);
+    // Initialize output projection layer with Xavier initialization
+    // Use smaller initialization for better stability
+    float std = std::sqrt(2.0f / (d_model + vocab_size)) * 0.5f;  // Reduced by 50%
     output_projection.randomize(std);
 }
 
@@ -73,15 +76,58 @@ std::string Transformer::generate(const std::string& prompt, SimpleTokenizer& to
         // Get logits for the last token position
         size_t last_pos = logits.rows - 1;
         
-        // Simple greedy decoding: pick the token with highest probability
-        float max_logit = logits[last_pos][0];
-        int next_token = 0;
-        
-        for (size_t j = 1; j < logits.cols; ++j) {
-            if (logits[last_pos][j] > max_logit) {
-                max_logit = logits[last_pos][j];
-                next_token = static_cast<int>(j);
+        // Debug: Print logits dimensions and some values
+        if (i < 3) {  // Only for first few generations
+            std::cout << "Debug: logits shape [" << logits.rows << ", " << logits.cols << "], vocab_size=" << vocab_size << std::endl;
+            std::cout << "Debug: first 10 logits: ";
+            for (size_t k = 0; k < std::min(size_t(10), logits.cols); ++k) {
+                std::cout << logits[last_pos][k] << " ";
             }
+            std::cout << std::endl;
+        }
+        
+        // Temperature sampling instead of greedy decoding
+        float temperature = 0.8f;  // Lower = more deterministic, higher = more random
+        
+        // Apply temperature scaling
+        std::vector<float> scaled_logits(logits.cols);
+        for (size_t j = 0; j < logits.cols; ++j) {
+            scaled_logits[j] = logits[last_pos][j] / temperature;
+        }
+        
+        // Compute softmax probabilities
+        float max_logit = *std::max_element(scaled_logits.begin(), scaled_logits.end());
+        std::vector<float> probabilities(logits.cols);
+        float sum_exp = 0.0f;
+        
+        for (size_t j = 0; j < logits.cols; ++j) {
+            probabilities[j] = std::exp(scaled_logits[j] - max_logit);
+            sum_exp += probabilities[j];
+        }
+        
+        for (size_t j = 0; j < logits.cols; ++j) {
+            probabilities[j] /= sum_exp;
+        }
+        
+        // Sample from the probability distribution
+        std::random_device rd;
+        std::mt19937 gen(rd());
+        std::uniform_real_distribution<float> dis(0.0f, 1.0f);
+        float random_val = dis(gen);
+        
+        int next_token = 0;
+        float cumulative_prob = 0.0f;
+        for (size_t j = 0; j < probabilities.size(); ++j) {
+            cumulative_prob += probabilities[j];
+            if (random_val <= cumulative_prob) {
+                next_token = static_cast<int>(j);
+                break;
+            }
+        }
+        
+        // Debug: Print selected token
+        if (i < 3) {
+            std::cout << "Debug: selected token " << next_token << " with probability " << probabilities[next_token] << std::endl;
         }
         
         // Stop if we generate EOS token

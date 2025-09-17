@@ -147,15 +147,17 @@ int main(int argc, char* argv[]) {
     }
     
     try {
-        // Initialize tokenizer (should match training)
+        // Initialize tokenizer and load vocab first
         SimpleTokenizer tokenizer;
+        std::string vocab_filename = model_path + ".vocab";
+        tokenizer.load_vocab(vocab_filename);
         
-        // Create model with same architecture as training
-        // Note: In practice, you'd save/load the model architecture too
-        size_t vocab_size = std::max(1000, tokenizer.vocab_size());
+        // Create model with correct vocab size
+        size_t vocab_size = static_cast<size_t>(tokenizer.vocab_size());
+        std::cout << "Creating model with vocab size: " << vocab_size << std::endl;
         TrainingTransformer model(vocab_size, 128, 4, 2, 512, 64);
         
-        // Try to load the model
+        // Load the model weights
         std::cout << "Loading model from: " << model_path << std::endl;
         model.load_model(model_path);
         

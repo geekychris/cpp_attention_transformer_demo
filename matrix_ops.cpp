@@ -178,6 +178,27 @@ namespace Activations {
         return 0.5f * x * (1.0f + std::tanh(std::sqrt(2.0f / M_PI) * (x + 0.044715f * x * x * x)));
     }
     
+    float gelu_derivative(float x) {
+        // Derivative of GELU: d/dx[0.5 * x * (1 + tanh(sqrt(2/π) * (x + 0.044715 * x³)))]
+        const float c1 = std::sqrt(2.0f / M_PI);  // sqrt(2/π)
+        const float c2 = 0.044715f;
+        const float inner = c1 * (x + c2 * x * x * x);
+        const float tanh_val = std::tanh(inner);
+        const float sech2_val = 1.0f - tanh_val * tanh_val;  // sech²(x) = 1 - tanh²(x)
+        
+        return 0.5f * (1.0f + tanh_val) + 0.5f * x * sech2_val * c1 * (1.0f + 3.0f * c2 * x * x);
+    }
+    
+    Matrix gelu_derivative_matrix(const Matrix& x) {
+        Matrix result(x.rows, x.cols);
+        for (size_t i = 0; i < x.rows; ++i) {
+            for (size_t j = 0; j < x.cols; ++j) {
+                result[i][j] = gelu_derivative(x[i][j]);
+            }
+        }
+        return result;
+    }
+    
     // GPU-accelerated GELU for matrices
     Matrix gelu_matrix(const Matrix& x) {
         // Check if we should use GPU acceleration
@@ -264,6 +285,70 @@ namespace Activations {
         }
         
         return result;
+    }
+    
+    LayerNormGradients layer_norm_backward(const Matrix& grad_output, const Matrix& input, 
+                                          const Matrix& gamma, const Matrix& beta, float eps) {
+        LayerNormGradients grads(input.rows, input.cols, input.cols);
+        
+        // Process each sequence position independently
+        for (size_t i = 0; i < input.rows; ++i) {
+            // Recompute forward pass values (mean, variance, normalized)
+            float mean = 0.0f;
+            for (size_t j = 0; j < input.cols; ++j) {
+                mean += input[i][j];
+            }
+            mean /= input.cols;
+            
+            float variance = 0.0f;
+            for (size_t j = 0; j < input.cols; ++j) {
+                float diff = input[i][j] - mean;
+                variance += diff * diff;
+            }
+            variance /= input.cols;
+            
+            float std_dev = std::sqrt(variance + eps);
+            float inv_std = 1.0f / std_dev;
+            
+            // Compute normalized values
+            std::vector<float> normalized(input.cols);
+            for (size_t j = 0; j < input.cols; ++j) {
+                normalized[j] = (input[i][j] - mean) * inv_std;
+            }
+            
+            // Gradients w.r.t. gamma and beta (accumulate across sequence)
+            for (size_t j = 0; j < input.cols; ++j) {
+                grads.grad_gamma[0][j] += grad_output[i][j] * normalized[j];
+                grads.grad_beta[0][j] += grad_output[i][j];
+            }
+            
+            // Gradient w.r.t. normalized values
+            std::vector<float> grad_normalized(input.cols);
+            for (size_t j = 0; j < input.cols; ++j) {
+                grad_normalized[j] = grad_output[i][j] * gamma[0][j];
+            }
+            
+            // Gradient w.r.t. input (complex chain rule through normalization)
+            float grad_var = 0.0f;
+            for (size_t j = 0; j < input.cols; ++j) {
+                grad_var += grad_normalized[j] * (input[i][j] - mean);
+            }
+            grad_var *= -0.5f * inv_std * inv_std * inv_std / input.cols;
+            
+            float grad_mean = 0.0f;
+            for (size_t j = 0; j < input.cols; ++j) {
+                grad_mean += grad_normalized[j] * (-inv_std);
+            }
+            grad_mean /= input.cols;
+            
+            for (size_t j = 0; j < input.cols; ++j) {
+                grads.grad_input[i][j] = grad_normalized[j] * inv_std + 
+                                       grad_var * 2.0f * (input[i][j] - mean) / input.cols + 
+                                       grad_mean;
+            }
+        }
+        
+        return grads;
     }
 }
 

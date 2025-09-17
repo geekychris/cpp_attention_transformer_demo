@@ -108,10 +108,37 @@ void Gradients::clip(float max_norm) {
 }
 
 // SGD Optimizer implementation
-SGDOptimizer::SGDOptimizer(float lr, float decay) 
-    : learning_rate(lr), weight_decay(decay) {}
+SGDOptimizer::SGDOptimizer(float lr, float decay, float max_norm) 
+    : learning_rate(lr), weight_decay(decay), max_grad_norm(max_norm) {}
+
+void SGDOptimizer::clip_gradients(Matrix& gradients) const {
+    // Compute gradient norm
+    float grad_norm = 0.0f;
+    for (size_t i = 0; i < gradients.rows; ++i) {
+        for (size_t j = 0; j < gradients.cols; ++j) {
+            grad_norm += gradients[i][j] * gradients[i][j];
+        }
+    }
+    grad_norm = std::sqrt(grad_norm);
+    
+    // Clip if necessary
+    if (grad_norm > max_grad_norm) {
+        float clip_factor = max_grad_norm / grad_norm;
+        for (size_t i = 0; i < gradients.rows; ++i) {
+            for (size_t j = 0; j < gradients.cols; ++j) {
+                gradients[i][j] *= clip_factor;
+            }
+        }
+    }
+}
 
 void SGDOptimizer::update(Matrix& weights, const Matrix& gradients) {
+    // Create a copy for clipping (don't modify the input)
+    Matrix clipped_gradients = gradients;
+    
+    // Apply gradient clipping
+    clip_gradients(clipped_gradients);
+    
     for (size_t i = 0; i < weights.rows; ++i) {
         for (size_t j = 0; j < weights.cols; ++j) {
             // Apply weight decay
@@ -119,8 +146,8 @@ void SGDOptimizer::update(Matrix& weights, const Matrix& gradients) {
                 weights[i][j] *= (1.0f - weight_decay * learning_rate);
             }
             
-            // Apply gradient update
-            weights[i][j] -= learning_rate * gradients[i][j];
+            // Apply gradient update with clipped gradients
+            weights[i][j] -= learning_rate * clipped_gradients[i][j];
         }
     }
 }
@@ -139,6 +166,13 @@ DataLoader::DataLoader(const std::string& filename, size_t batch_sz, size_t max_
     }
     
     std::cout << "Loaded " << data.size() << " lines from " << filename << std::endl;
+    
+    // CRITICAL FIX: Build vocabulary from all training data during construction
+    std::cout << "Building vocabulary from " << data.size() << " lines..." << std::endl;
+    for (const auto& text : data) {
+        tokenizer->encode(text);  // This builds the vocabulary as a side effect
+    }
+    std::cout << "Vocabulary built: " << tokenizer->vocab_size() << " tokens" << std::endl;
 }
 
 bool DataLoader::has_next() const {
@@ -183,8 +217,43 @@ void DataLoader::reset() {
 
 // TrainingTransformer implementation
 TrainingTransformer::TrainingTransformer(size_t vocab_sz, size_t model_dim, size_t heads, size_t layers, size_t ff_dim, size_t max_len)
-    : Transformer(vocab_sz, model_dim, heads, layers, ff_dim, max_len) {
-    optimizer = std::make_unique<SGDOptimizer>();
+    : Transformer(vocab_sz, model_dim, heads, layers, ff_dim, max_len), 
+      cached_transformer_output(0, 0) {
+    // Initialize with more stable parameters: lower learning rate, gradient clipping
+    optimizer = std::make_unique<SGDOptimizer>(0.0001f, 0.0f, 0.5f);  // lr=0.0001, no weight decay, max_grad_norm=0.5
+}
+
+Matrix TrainingTransformer::forward(const std::vector<int>& tokens) const {
+    // Cache input tokens for backprop
+    cached_input_tokens = tokens;
+    
+    size_t seq_len = tokens.size();
+    if (seq_len > max_seq_len) {
+        throw std::invalid_argument("Sequence length exceeds maximum allowed length");
+    }
+    
+    // Token embeddings
+    Matrix token_embeddings = embedding->forward(tokens);  // [seq_len, d_model]
+    
+    // Positional encodings
+    Matrix pos_embeddings = pos_encoding->get_encoding(seq_len);  // [seq_len, d_model]
+    
+    // Add token and positional embeddings
+    Matrix x = token_embeddings + pos_embeddings;  // [seq_len, d_model]
+    
+    // Pass through decoder layers
+    Matrix empty_encoder_output(0, 0);  // For decoder-only model
+    for (const auto& layer : decoder_layers) {
+        x = layer->forward(x, empty_encoder_output);
+    }
+    
+    // Cache the transformer layer output (before final projection)
+    cached_transformer_output = x;
+    
+    // Final output projection to vocabulary
+    Matrix logits = x * output_projection;  // [seq_len, vocab_size]
+    
+    return logits;
 }
 
 float TrainingTransformer::train_step(const DataLoader::Batch& batch) {
@@ -199,6 +268,13 @@ float TrainingTransformer::train_step(const DataLoader::Batch& batch) {
         
         // Compute loss
         float loss = Loss::cross_entropy(logits, target_tokens);
+        
+        // Check for NaN or exploding loss
+        if (std::isnan(loss) || loss > 50.0f) {
+            std::cout << "\n⚠️  Unstable loss detected: " << loss << ". Skipping this batch." << std::endl;
+            continue;  // Skip this batch
+        }
+        
         total_loss += loss;
         
         // Simple numerical gradients for demonstration
@@ -211,29 +287,61 @@ float TrainingTransformer::train_step(const DataLoader::Batch& batch) {
 }
 
 void TrainingTransformer::backward(const Matrix& loss_grad) {
-    // This is a simplified version - in practice you'd implement full backprop
-    // loss_grad is [seq_len, vocab_size] but output_projection is [d_model, vocab_size]
-    // We need to compute the gradient w.r.t. output_projection
+    // NOW IMPLEMENTING PROPER BACKPROPAGATION! 🚀
+    // loss_grad is [seq_len, vocab_size] from cross-entropy loss
+    // output_projection is [d_model, vocab_size]
+    // cached_transformer_output is [seq_len, d_model]
     
-    // For now, just apply a small random perturbation to avoid complete stagnation
-    // In a real implementation, you'd compute x^T * loss_grad where x is the input to output layer
-    float lr = optimizer->get_learning_rate();
+    if (cached_transformer_output.rows == 0) {
+        std::cerr << "Error: No cached activations for backprop!" << std::endl;
+        return;
+    }
     
-    // Create a small gradient matrix with proper dimensions
-    Matrix proj_grad = Matrix::zeros(output_projection.rows, output_projection.cols);
+    // Compute gradient for output projection: W_grad = X^T @ loss_grad
+    // Where X is transformer output [seq_len, d_model] and loss_grad is [seq_len, vocab_size]
+    // Result should be [d_model, vocab_size]
     
-    // Apply very small random updates (this is a placeholder for proper backprop)
-    std::random_device rd;
-    std::mt19937 gen(rd());
-    std::normal_distribution<float> dist(0.0f, 1e-6f);
+    Matrix X_T = cached_transformer_output.transpose();  // [d_model, seq_len]
+    Matrix proj_grad = X_T * loss_grad;  // [d_model, vocab_size]
     
+    // Normalize by sequence length for stability
+    float seq_len = static_cast<float>(loss_grad.rows);
     for (size_t i = 0; i < proj_grad.rows; ++i) {
         for (size_t j = 0; j < proj_grad.cols; ++j) {
-            proj_grad[i][j] = dist(gen);
+            proj_grad[i][j] /= seq_len;
         }
     }
     
+    // Apply gradient update to output projection
     optimizer->update(output_projection, proj_grad);
+    
+    // Compute gradients for transformer layers
+    // gradient w.r.t. transformer output: loss_grad @ output_projection^T
+    Matrix output_proj_T = output_projection.transpose();  // [vocab_size, d_model]
+    Matrix transformer_grad = loss_grad * output_proj_T;  // [seq_len, d_model]
+    
+    // Backpropagate through decoder layers (in reverse order)
+    Matrix current_grad = transformer_grad;
+    Matrix empty_encoder_output(0, 0);
+    
+    for (int i = static_cast<int>(decoder_layers.size()) - 1; i >= 0; --i) {
+        current_grad = decoder_layers[i]->backward(current_grad, empty_encoder_output);
+        decoder_layers[i]->apply_gradients(optimizer->get_learning_rate());
+    }
+    
+    // Update embedding weights based on input tokens
+    // current_grad now contains gradients w.r.t. the transformer input (after embeddings)
+    Matrix& embeddings_matrix = embedding->get_embeddings();
+    for (size_t t = 0; t < cached_input_tokens.size(); ++t) {
+        int token_id = cached_input_tokens[t];
+        if (token_id >= 0 && static_cast<size_t>(token_id) < embeddings_matrix.rows && t < current_grad.rows) {
+            // Update embedding for this token using gradients from transformer layers
+            for (size_t d = 0; d < current_grad.cols && d < embeddings_matrix.cols; ++d) {
+                float grad = current_grad[t][d] / static_cast<float>(cached_input_tokens.size());
+                embeddings_matrix[token_id][d] -= optimizer->get_learning_rate() * grad;
+            }
+        }
+    }
 }
 
 float TrainingTransformer::validate(DataLoader& val_loader) {
@@ -267,6 +375,10 @@ float TrainingTransformer::validate(DataLoader& val_loader) {
 void TrainingTransformer::train_epoch(DataLoader& train_loader, DataLoader& val_loader, int epoch) {
     train_loader.reset();
     
+    size_t total_batches = train_loader.get_total_batches();
+    std::cout << "\n=== Epoch " << epoch << " ===" << std::endl;
+    std::cout << "Training on " << total_batches << " batches..." << std::endl;
+    
     float epoch_loss = 0.0f;
     int step = 0;
     
@@ -276,21 +388,38 @@ void TrainingTransformer::train_epoch(DataLoader& train_loader, DataLoader& val_
         auto batch = train_loader.next_batch();
         
         float batch_loss = train_step(batch);
+        
+        // Check for training instability
+        if (std::isnan(batch_loss) || batch_loss > 100.0f) {
+            std::cout << "\n❌ Training instability detected. Stopping epoch early." << std::endl;
+            std::cout << "   Final loss: " << batch_loss << " at step " << step << std::endl;
+            break;
+        }
+        
         epoch_loss += batch_loss;
         step++;
         
-        if (step % 10 == 0) {
-            std::cout << "  Step " << step << ", Loss: " << std::fixed << std::setprecision(4) << batch_loss << std::endl;
+        // Show progress every 20 steps or at key milestones
+        if (step % 20 == 0 || step == 1 || static_cast<size_t>(step) == total_batches) {
+            auto current_time = std::chrono::high_resolution_clock::now();
+            auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(current_time - epoch_start);
+            float progress = (float)step / total_batches * 100.0f;
+            std::cout << "  [" << std::fixed << std::setprecision(1) << progress << "%] "
+                      << "Step " << std::setw(3) << step << "/" << total_batches 
+                      << " | Loss: " << std::setprecision(4) << batch_loss
+                      << " | Elapsed: " << elapsed.count() << "s" << std::endl;
         }
     }
     
     float val_loss = validate(val_loader);
     
     auto epoch_end = std::chrono::high_resolution_clock::now();
-    auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(epoch_end - epoch_start);
+    auto duration = std::chrono::duration_cast<std::chrono::seconds>(epoch_end - epoch_start);
     
-    std::cout << "Epoch " << epoch << " - Train Loss: " << std::fixed << std::setprecision(4) << (epoch_loss / step) 
-              << ", Val Loss: " << val_loss << " (" << duration.count() << "ms)" << std::endl;
+    std::cout << "\n✓ Epoch " << epoch << " Complete" << std::endl;
+    std::cout << "  Train Loss: " << std::fixed << std::setprecision(4) << (epoch_loss / step) 
+              << " | Val Loss: " << val_loss 
+              << " | Duration: " << duration.count() << "s" << std::endl;
 }
 
 void TrainingTransformer::save_model(const std::string& filename) const {
@@ -352,6 +481,28 @@ void TrainingTransformer::load_model(const std::string& filename) {
     std::cout << "Model loaded from " << filename << std::endl;
 }
 
+void TrainingTransformer::save_model_with_tokenizer(const std::string& filename, const SimpleTokenizer& tokenizer) const {
+    // Save the model
+    save_model(filename);
+    
+    // Save the tokenizer vocabulary
+    std::string vocab_filename = filename + ".vocab";
+    tokenizer.save_vocab(vocab_filename);
+    
+    std::cout << "Model and tokenizer saved to " << filename << " and " << vocab_filename << std::endl;
+}
+
+void TrainingTransformer::load_model_with_tokenizer(const std::string& filename, SimpleTokenizer& tokenizer) {
+    // Load the model
+    load_model(filename);
+    
+    // Load the tokenizer vocabulary
+    std::string vocab_filename = filename + ".vocab";
+    tokenizer.load_vocab(vocab_filename);
+    
+    std::cout << "Model and tokenizer loaded from " << filename << " and " << vocab_filename << std::endl;
+}
+
 void TrainingTransformer::set_learning_rate(float lr) {
     if (optimizer) {
         optimizer->set_learning_rate(lr);
@@ -378,8 +529,10 @@ void train_model(TrainingConfig config) {
     SimpleTokenizer tokenizer;
     
     // Create data loaders
+    std::cout << "DEBUG: Tokenizer vocab size before data loading: " << tokenizer.vocab_size() << std::endl;
     DataLoader train_loader(config.train_data_path, config.batch_size, 64, tokenizer);
     DataLoader val_loader(config.val_data_path, config.batch_size, 64, tokenizer);
+    std::cout << "DEBUG: Tokenizer vocab size after data loading: " << tokenizer.vocab_size() << std::endl;
     
     // Ensure tokenizer has a reasonable vocab size
     if (tokenizer.vocab_size() < 10) {
@@ -389,8 +542,13 @@ void train_model(TrainingConfig config) {
         }
     }
     
-    // Create model
-    size_t vocab_size = std::max(size_t(1000), static_cast<size_t>(tokenizer.vocab_size()));
+    // Create model with correct vocab size
+    size_t vocab_size = static_cast<size_t>(tokenizer.vocab_size());
+    
+    // DEBUG: Print detailed tokenizer info
+    std::cout << "DEBUG: Tokenizer vocab size after data loading: " << tokenizer.vocab_size() << std::endl;
+    std::cout << "DEBUG: Creating model with vocab size: " << vocab_size << std::endl;
+    
     TrainingTransformer model(vocab_size, 128, 4, 2, 512, 64);
     model.set_learning_rate(config.learning_rate);
     
@@ -405,13 +563,13 @@ void train_model(TrainingConfig config) {
         // Save model periodically
         if (epoch % 5 == 0 || epoch == config.epochs) {
             std::string save_path = config.model_save_path + "_epoch_" + std::to_string(epoch) + ".bin";
-            model.save_model(save_path);
+            model.save_model_with_tokenizer(save_path, tokenizer);
         }
         
         std::cout << std::endl;
     }
     
     // Save final model
-    model.save_model(config.model_save_path);
+    model.save_model_with_tokenizer(config.model_save_path, tokenizer);
     std::cout << "Training completed!" << std::endl;
 }
