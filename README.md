@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/logo.png" alt="CPP Attention Transformer Demo logo" width="180">
+</p>
+
 # C++ Transformer Implementation
 
 A complete C++ implementation of a Transformer neural network with training and inference capabilities.
